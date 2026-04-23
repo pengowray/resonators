@@ -2,7 +2,7 @@ name: Deploy Pages
 
 on:
   push:
-    branches: [main, wasm-simd-pr]
+    branches: [main, pages-wasm-simd-pr]
   workflow_dispatch:
 
 permissions:
