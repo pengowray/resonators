@@ -22,3 +22,6 @@ harness = false
 
 [dependencies]
 num-complex = "0.4.6"
+# Portable SIMD: f32x4 compiles to WASM SIMD128 (target-feature=+simd128),
+# SSE2/SSE4 on x86, NEON on aarch64, scalar fallback everywhere else.
+wide = "0.8"

@@ -1,10 +1,31 @@
 use std::f32::consts::PI;
 
 use num_complex::Complex32;
+use wide::f32x4;
 
 use crate::STABILIZE_EVERY;
 use crate::config::ResonatorConfig;
 use crate::dynamics::heuristic_alphas;
+
+/// Unaligned 128-bit load of four contiguous `f32`s starting at `buf[offset]`.
+///
+/// # Safety
+/// Caller must ensure `offset + 4 <= buf.len()`.
+#[inline(always)]
+unsafe fn load_f32x4(buf: &[f32], offset: usize) -> f32x4 {
+    unsafe { core::ptr::read_unaligned(buf.as_ptr().add(offset) as *const f32x4) }
+}
+
+/// Unaligned 128-bit store of four contiguous `f32`s starting at `buf[offset]`.
+///
+/// # Safety
+/// Caller must ensure `offset + 4 <= buf.len()`.
+#[inline(always)]
+unsafe fn store_f32x4(buf: &mut [f32], offset: usize, value: f32x4) {
+    unsafe {
+        core::ptr::write_unaligned(buf.as_mut_ptr().add(offset) as *mut f32x4, value);
+    }
+}
 
 /// A bank of independent resonators, each tuned to a fixed frequency.
 ///
@@ -104,26 +125,7 @@ impl ResonatorBank {
     /// Updates every resonator with a single input sample.
     #[inline]
     pub fn process_sample(&mut self, sample: f32) {
-        for k in 0..self.n_resonators {
-            let alpha = self.alphas[k];
-            let beta = self.betas[k];
-            let alpha_sample = alpha * sample;
-
-            // EWMA accumulation
-            self.r_re[k] = (1.0 - alpha).mul_add(self.r_re[k], alpha_sample * self.z_re[k]);
-            self.r_im[k] = (1.0 - alpha).mul_add(self.r_im[k], alpha_sample * self.z_im[k]);
-
-            // output smoothing
-            self.rr_re[k] = (1.0 - beta).mul_add(self.rr_re[k], beta * self.r_re[k]);
-            self.rr_im[k] = (1.0 - beta).mul_add(self.rr_im[k], beta * self.r_im[k]);
-
-            // rotate phasor
-            let zr = self.z_re[k];
-            let zi = self.z_im[k];
-            self.z_re[k] = zr * self.w_re[k] - zi * self.w_im[k];
-            self.z_im[k] = zr * self.w_im[k] + zi * self.w_re[k];
-        }
-
+        self.process_sample_inner(sample);
         self.sample_count += 1;
         if self.sample_count.is_multiple_of(STABILIZE_EVERY) {
             self.stabilize();
@@ -131,10 +133,110 @@ impl ResonatorBank {
     }
 
     /// Updates every resonator with a block of input samples, in order.
+    ///
+    /// Amortizes per-sample overhead (stabilization check, function call) by
+    /// stabilizing in bulk at fixed boundaries instead of per-sample.
     #[inline]
     pub fn process_samples(&mut self, samples: &[f32]) {
-        for &s in samples {
-            self.process_sample(s);
+        let mut i = 0;
+        while i < samples.len() {
+            // How many samples can we process before the next stabilization?
+            let until_stabilize = STABILIZE_EVERY - (self.sample_count % STABILIZE_EVERY);
+            let take = (samples.len() - i).min(until_stabilize as usize);
+            for &s in &samples[i..i + take] {
+                self.process_sample_inner(s);
+            }
+            self.sample_count += take as u64;
+            if self.sample_count.is_multiple_of(STABILIZE_EVERY) {
+                self.stabilize();
+            }
+            i += take;
+        }
+    }
+
+    /// Core per-sample update across all bins. SIMD fast path processes 4
+    /// bins at a time via `wide::f32x4`; scalar tail handles any remainder.
+    ///
+    /// Does **not** advance `sample_count` or stabilize — callers do that.
+    #[inline(always)]
+    fn process_sample_inner(&mut self, sample: f32) {
+        let n = self.n_resonators;
+        let vec_end = n & !3; // round down to multiple of 4
+
+        let sample_v = f32x4::splat(sample);
+        let one_v = f32x4::splat(1.0);
+
+        // SIMD fast path: process 4 bins per iteration via `wide::f32x4`.
+        // We use `ptr::read_unaligned`/`write_unaligned` with `f32x4` casts
+        // to get single 128-bit load/store instructions (movups on SSE,
+        // v128.load/store on WASM SIMD128, vld1q_f32 on NEON) — the
+        // array-literal `f32x4::new([a,b,c,d])` path generates per-lane
+        // inserts that defeat auto-vectorization.
+        //
+        // Safety: all 10 backing `Vec<f32>` buffers share
+        // `n_resonators` elements, and `vec_end` is `n & !3`, so every
+        // `k..k+4` subslice is in-bounds. `f32x4` is `#[repr(C,
+        // align(16))]` with exactly 16 bytes layout, matching four
+        // contiguous `f32`s.
+        let mut k = 0;
+        unsafe {
+            while k < vec_end {
+                let alpha = load_f32x4(&self.alphas, k);
+                let beta = load_f32x4(&self.betas, k);
+                let z_re = load_f32x4(&self.z_re, k);
+                let z_im = load_f32x4(&self.z_im, k);
+                let r_re_old = load_f32x4(&self.r_re, k);
+                let r_im_old = load_f32x4(&self.r_im, k);
+                let rr_re_old = load_f32x4(&self.rr_re, k);
+                let rr_im_old = load_f32x4(&self.rr_im, k);
+                let w_re = load_f32x4(&self.w_re, k);
+                let w_im = load_f32x4(&self.w_im, k);
+
+                let one_m_alpha = one_v - alpha;
+                let one_m_beta = one_v - beta;
+                let alpha_sample = alpha * sample_v;
+
+                // EWMA accumulation: r = (1 - alpha) * r_prev + alpha_sample * z
+                let r_re = one_m_alpha.mul_add(r_re_old, alpha_sample * z_re);
+                let r_im = one_m_alpha.mul_add(r_im_old, alpha_sample * z_im);
+
+                // Output smoothing: rr = (1 - beta) * rr_prev + beta * r
+                let rr_re = one_m_beta.mul_add(rr_re_old, beta * r_re);
+                let rr_im = one_m_beta.mul_add(rr_im_old, beta * r_im);
+
+                // Phasor rotation: z_new = z * w (complex multiply)
+                let z_re_new = z_re * w_re - z_im * w_im;
+                let z_im_new = z_re * w_im + z_im * w_re;
+
+                store_f32x4(&mut self.r_re, k, r_re);
+                store_f32x4(&mut self.r_im, k, r_im);
+                store_f32x4(&mut self.rr_re, k, rr_re);
+                store_f32x4(&mut self.rr_im, k, rr_im);
+                store_f32x4(&mut self.z_re, k, z_re_new);
+                store_f32x4(&mut self.z_im, k, z_im_new);
+
+                k += 4;
+            }
+        }
+
+        // Scalar tail for any remaining bins (n not a multiple of 4).
+        while k < n {
+            let alpha = self.alphas[k];
+            let beta = self.betas[k];
+            let alpha_sample = alpha * sample;
+
+            self.r_re[k] = (1.0 - alpha).mul_add(self.r_re[k], alpha_sample * self.z_re[k]);
+            self.r_im[k] = (1.0 - alpha).mul_add(self.r_im[k], alpha_sample * self.z_im[k]);
+
+            self.rr_re[k] = (1.0 - beta).mul_add(self.rr_re[k], beta * self.r_re[k]);
+            self.rr_im[k] = (1.0 - beta).mul_add(self.rr_im[k], beta * self.r_im[k]);
+
+            let zr = self.z_re[k];
+            let zi = self.z_im[k];
+            self.z_re[k] = zr * self.w_re[k] - zi * self.w_im[k];
+            self.z_im[k] = zr * self.w_im[k] + zi * self.w_re[k];
+
+            k += 1;
         }
     }
 
@@ -382,5 +484,100 @@ mod tests {
         let configs = vec![ResonatorConfig::new(440.0, 0.01, 0.01)];
         let mut bank = ResonatorBank::new(&configs, 44100.0);
         let _ = bank.resonate(&[0.0; 100], 0);
+    }
+
+    /// Independent scalar reference for SIMD parity testing.
+    ///
+    /// Mirrors the algorithm in `process_sample_inner` without any SIMD ops.
+    /// The SIMD path must produce numerically equivalent results (within
+    /// f32 rounding) for the test suite to trust it.
+    fn scalar_reference_bank(
+        configs: &[ResonatorConfig],
+        sample_rate: f32,
+        signal: &[f32],
+    ) -> Vec<Complex32> {
+        let n = configs.len();
+        let mut alphas = Vec::with_capacity(n);
+        let mut betas = Vec::with_capacity(n);
+        let mut w_re = Vec::with_capacity(n);
+        let mut w_im = Vec::with_capacity(n);
+        let mut z_re = vec![1.0f32; n];
+        let mut z_im = vec![0.0f32; n];
+        let mut r_re = vec![0.0f32; n];
+        let mut r_im = vec![0.0f32; n];
+        let mut rr_re = vec![0.0f32; n];
+        let mut rr_im = vec![0.0f32; n];
+
+        for c in configs {
+            alphas.push(c.alpha);
+            betas.push(c.beta);
+            let ang = -2.0 * PI * c.freq / sample_rate;
+            w_re.push(ang.cos());
+            w_im.push(ang.sin());
+        }
+
+        let mut sample_count = 0u64;
+        for &s in signal {
+            for k in 0..n {
+                let a = alphas[k];
+                let b = betas[k];
+                let a_s = a * s;
+                r_re[k] = (1.0 - a).mul_add(r_re[k], a_s * z_re[k]);
+                r_im[k] = (1.0 - a).mul_add(r_im[k], a_s * z_im[k]);
+                rr_re[k] = (1.0 - b).mul_add(rr_re[k], b * r_re[k]);
+                rr_im[k] = (1.0 - b).mul_add(rr_im[k], b * r_im[k]);
+                let zr = z_re[k];
+                let zi = z_im[k];
+                z_re[k] = zr * w_re[k] - zi * w_im[k];
+                z_im[k] = zr * w_im[k] + zi * w_re[k];
+            }
+            sample_count += 1;
+            if sample_count.is_multiple_of(STABILIZE_EVERY) {
+                for k in 0..n {
+                    let inv_mag = 1.0 / (z_re[k] * z_re[k] + z_im[k] * z_im[k]).sqrt();
+                    z_re[k] *= inv_mag;
+                    z_im[k] *= inv_mag;
+                }
+            }
+        }
+
+        (0..n).map(|k| Complex32::new(rr_re[k], rr_im[k])).collect()
+    }
+
+    /// SIMD path must match the independent scalar reference to within f32
+    /// rounding. Exercises both the full SIMD lanes and the scalar tail.
+    #[test]
+    fn simd_matches_scalar_reference() {
+        let sr = 44_100.0f32;
+        // 13 bins — exercises 3 full SIMD iterations + 1 scalar tail bin.
+        let freqs = [
+            100.0, 200.0, 300.0, 440.0, 600.0, 880.0, 1200.0, 1760.0,
+            2400.0, 3520.0, 5000.0, 7040.0, 10_000.0,
+        ];
+        let configs: Vec<_> = freqs
+            .iter()
+            .map(|&f| {
+                let a = heuristic_alpha(f, sr);
+                ResonatorConfig::new(f, a, a)
+            })
+            .collect();
+        // Signal spans multiple STABILIZE_EVERY boundaries.
+        let signal: Vec<f32> = (0..4000)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / sr).cos() * 0.7)
+            .collect();
+
+        let mut bank = ResonatorBank::new(&configs, sr);
+        bank.process_samples(&signal);
+        let simd: Vec<Complex32> = (0..bank.len()).map(|i| bank.complex(i)).collect();
+
+        let scalar = scalar_reference_bank(&configs, sr, &signal);
+
+        assert_eq!(simd.len(), scalar.len());
+        for (i, (s, r)) in simd.iter().zip(&scalar).enumerate() {
+            assert!(
+                (s.re - r.re).abs() < 1e-5 && (s.im - r.im).abs() < 1e-5,
+                "bin {i}: simd={s:?} scalar={r:?}"
+            );
+        }
     }
 }
