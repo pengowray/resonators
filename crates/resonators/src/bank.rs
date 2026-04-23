@@ -154,6 +154,29 @@ impl ResonatorBank {
         }
     }
 
+    /// Like [`process_samples`] but forces the scalar code path (no SIMD).
+    ///
+    /// Intended purely for benchmarking — comparing this to
+    /// [`process_samples`] in the same binary lets you measure the SIMD
+    /// speedup without rebuilding with different target features. Not
+    /// useful for normal processing.
+    #[inline]
+    pub fn process_samples_scalar(&mut self, samples: &[f32]) {
+        let mut i = 0;
+        while i < samples.len() {
+            let until_stabilize = STABILIZE_EVERY - (self.sample_count % STABILIZE_EVERY);
+            let take = (samples.len() - i).min(until_stabilize as usize);
+            for &s in &samples[i..i + take] {
+                self.process_sample_inner_scalar(s);
+            }
+            self.sample_count += take as u64;
+            if self.sample_count.is_multiple_of(STABILIZE_EVERY) {
+                self.stabilize();
+            }
+            i += take;
+        }
+    }
+
     /// Core per-sample update across all bins. SIMD fast path processes 4
     /// bins at a time via `wide::f32x4`; scalar tail handles any remainder.
     ///
@@ -237,6 +260,30 @@ impl ResonatorBank {
             self.z_im[k] = zr * self.w_im[k] + zi * self.w_re[k];
 
             k += 1;
+        }
+    }
+
+    /// Scalar variant of [`process_sample_inner`] — one bin at a time, no
+    /// SIMD types. Used only by the benchmarking-oriented
+    /// [`process_samples_scalar`]. LLVM may still auto-vectorize this on
+    /// targets where it's able to do so (notably x86_64 with SSE baseline).
+    #[inline(always)]
+    fn process_sample_inner_scalar(&mut self, sample: f32) {
+        for k in 0..self.n_resonators {
+            let alpha = self.alphas[k];
+            let beta = self.betas[k];
+            let alpha_sample = alpha * sample;
+
+            self.r_re[k] = (1.0 - alpha).mul_add(self.r_re[k], alpha_sample * self.z_re[k]);
+            self.r_im[k] = (1.0 - alpha).mul_add(self.r_im[k], alpha_sample * self.z_im[k]);
+
+            self.rr_re[k] = (1.0 - beta).mul_add(self.rr_re[k], beta * self.r_re[k]);
+            self.rr_im[k] = (1.0 - beta).mul_add(self.rr_im[k], beta * self.r_im[k]);
+
+            let zr = self.z_re[k];
+            let zi = self.z_im[k];
+            self.z_re[k] = zr * self.w_re[k] - zi * self.w_im[k];
+            self.z_im[k] = zr * self.w_im[k] + zi * self.w_re[k];
         }
     }
 
